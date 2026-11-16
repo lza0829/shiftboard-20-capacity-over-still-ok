@@ -34,10 +34,11 @@ onMounted(async () => {
               <td>{{ s.name }}</td>
               <td>{{ s.keeper }}</td>
               <td><span class="tag" :class="{ on: s.status === '值班中' }">{{ s.status }}</span></td>
-              <td>{{ s.inflight }}/{{ s.inflight_limit }}</td>
+              <td :class="{ 'num-danger': s.inflight > s.inflight_limit }">{{ s.inflight }}/{{ s.inflight_limit }}</td>
             </tr>
           </tbody>
         </table>
+        <p class="src-note">在途数由 batches 表 COUNT 同源派生，与交班预检快照、容量裁决只读接口同一口径。</p>
       </div>
     </template>
   </div>

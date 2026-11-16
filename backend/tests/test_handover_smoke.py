@@ -211,3 +211,141 @@ def test_mid_transfer_anomaly_rolls_back(client):
     assert done2.status_code == 200, done2.text
     assert done2.json()["status"] == "已完成"
     assert _inflight(client, sender) == 0
+
+
+def test_precheck_numbers_match_batch_inflight(client):
+    """预检数字必须与批次表派生的接班方在途数同源，对不上即为旁路。"""
+    sender = _sender_with_inflight(client)
+    receiver = _other_shift(client, sender)
+    client.put(f"/api/shifts/{receiver}/capacity", json={"inflight_limit": 100})
+    started = client.post(
+        "/api/handovers/start",
+        json={"from_shift_id": sender, "to_shift_id": receiver},
+    )
+    assert started.status_code == 200, started.text
+    hid = started.json()["id"]
+    pre = client.get(f"/api/handovers/{hid}/precheck").json()
+    # 预检「当前在途」== 按批次表实时数出的接班方在途
+    assert pre["当前在途"] == _inflight(client, receiver)
+    # 本单键数 == 清单行数 == 交班方在途批次数
+    assert pre["本单键数"] == started.json()["batch_count"]
+    assert pre["本单键数"] == _inflight(client, sender)
+    assert pre["差值"] == pre["上限"] - pre["当前在途"] - pre["本单键数"]
+    # 收尾：完成本单，避免进行中交班阻塞后续测试
+    done = client.post(f"/api/handovers/{hid}/complete")
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "已完成"
+
+
+def test_capacity_verdict_readonly_snapshot_vs_actual(client):
+    """容量裁决只读接口：返回预检快照与事后在途实数的对照结构。"""
+    sender = _sender_with_inflight(client)
+    receiver = _other_shift(client, sender)
+    n_receiver = _inflight(client, receiver)
+    client.put(f"/api/shifts/{receiver}/capacity", json={"inflight_limit": 100})
+    started = client.post(
+        "/api/handovers/start",
+        json={"from_shift_id": sender, "to_shift_id": receiver},
+    )
+    hid = started.json()["id"]
+    n_items = started.json()["batch_count"]
+
+    # 完成前：无快照，对照为 None，事后实数仍可读
+    before_v = client.get(f"/api/handovers/{hid}/capacity-verdict")
+    assert before_v.status_code == 200, before_v.text
+    bv = before_v.json()
+    assert bv["预检快照"] is None
+    assert bv["对照"] is None
+    assert bv["事后实数"]["接班方在途实数"] == n_receiver
+
+    done = client.post(f"/api/handovers/{hid}/complete")
+    assert done.status_code == 200, done.text
+
+    v = client.get(f"/api/handovers/{hid}/capacity-verdict").json()
+    snap = v["预检快照"]
+    assert snap["decision"] == "通过"
+    assert snap["current_inflight"] == n_receiver
+    assert snap["item_count"] == n_items
+    assert snap["capacity_limit"] == 100
+    assert snap["headroom"] == 100 - n_receiver - n_items
+    # 事后在途实数同样从批次表派生
+    assert v["事后实数"]["接班方在途实数"] == _inflight(client, receiver)
+    cmp_ = v["对照"]
+    assert cmp_["预检预判接班方在途"] == n_receiver + n_items
+    assert cmp_["事后接班方在途实数"] == n_receiver + n_items
+    assert cmp_["在途差值(事后-预判)"] == 0
+    assert cmp_["事后是否超容"] is False
+
+    # 上限事后被调小：快照不可变，对照应标出当前已超容
+    client.put(f"/api/shifts/{receiver}/capacity", json={"inflight_limit": 1})
+    v2 = client.get(f"/api/handovers/{hid}/capacity-verdict").json()
+    assert v2["预检快照"]["capacity_limit"] == 100  # 快照未被改写
+    assert v2["事后实数"]["当前上限"] == 1
+    assert v2["对照"]["上限是否被改动"] is True
+    assert v2["对照"]["事后是否超容"] is True
+
+    assert client.get("/api/handovers/9999/capacity-verdict").status_code == 404
+
+
+def test_mid_insert_over_capacity_rolls_back_whole_order(client):
+    """中途插入导致超容：同一失败闭内整单回滚到完成前归属，零部分过户。"""
+    sender = _sender_with_inflight(client)
+    receiver = _other_shift(client, sender)
+    n_sender = _inflight(client, sender)
+    n_receiver = _inflight(client, receiver)
+    # 上限恰好等于「当前在途 + 本单键数」：预检贴线通过，
+    # 一旦同事务内多出一个在途批次落到接班方，事后复核必超容
+    client.put(
+        f"/api/shifts/{receiver}/capacity",
+        json={"inflight_limit": n_receiver + n_sender},
+    )
+    started = client.post(
+        "/api/handovers/start",
+        json={"from_shift_id": sender, "to_shift_id": receiver},
+    )
+    assert started.status_code == 200, started.text
+    hid = started.json()["id"]
+    assert client.get(f"/api/handovers/{hid}/precheck").json()["裁决"] == "预计通过"
+
+    # 触发器在过户事务内部、批次归属 UPDATE 发生时插入接班方在途批次，
+    # 模拟预检之后、过户之中的中途插入；触发动作与过户同生共死
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TRIGGER trg_intrude_inflight
+        BEFORE UPDATE ON batches
+        BEGIN
+          INSERT INTO batches(biz_key, title, owner_shift_id, status)
+          VALUES ('B-INTRUDE-' || NEW.id, '中途插入批次', NEW.owner_shift_id, '在途');
+        END
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    done = client.post(f"/api/handovers/{hid}/complete")
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP TRIGGER trg_intrude_inflight")
+    conn.commit()
+    conn.close()
+
+    # 整单回滚：409、交班单仍进行中、归属回到完成前、无预检快照落库
+    assert done.status_code == 409, done.text
+    h = client.get(f"/api/handovers/{hid}").json()
+    assert h["status"] == "进行中"
+    assert _inflight(client, sender) == n_sender
+    assert _inflight(client, receiver) == n_receiver
+    assert client.get(f"/api/handovers/{hid}/precheck").json()["已落库"] is False
+    v = client.get(f"/api/handovers/{hid}/capacity-verdict").json()
+    assert v["预检快照"] is None  # 回滚连预检固化一并撤销
+    # 触发插入物随事务回滚，不留残批次
+    leftovers = client.get("/api/batches").json()
+    assert not any(b["biz_key"].startswith("B-INTRUDE-") for b in leftovers)
+
+    # 触发器摘除后可正常完成
+    done2 = client.post(f"/api/handovers/{hid}/complete")
+    assert done2.status_code == 200, done2.text
+    assert done2.json()["status"] == "已完成"
+    assert _inflight(client, sender) == 0
+    assert _inflight(client, receiver) == n_receiver + n_sender

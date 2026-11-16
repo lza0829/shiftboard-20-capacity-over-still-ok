@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 from fastapi import HTTPException
@@ -190,6 +191,65 @@ def precheck_handover(handover_id: int) -> dict:
         }
 
 
+def capacity_verdict(handover_id: int) -> dict:
+    """容量裁决只读接口（按交班单 id）：预检快照与事后在途实数对照。
+
+    预检快照取自 capacity_prechecks（完成时同事务固化），事后实数一律从
+    批次表同源派生；本接口只读，不写任何容量计数器。
+    """
+    with connect() as conn:
+        h = conn.execute(
+            """
+            SELECT h.*, ts.name AS to_shift_name
+            FROM handovers h
+            JOIN shifts ts ON ts.id = h.to_shift_id
+            WHERE h.id = ?
+            """,
+            (handover_id,),
+        ).fetchone()
+        if not h:
+            raise HTTPException(404, "交班单不存在")
+        pre_row = conn.execute(
+            "SELECT * FROM capacity_prechecks WHERE handover_id = ?",
+            (handover_id,),
+        ).fetchone()
+        limit = conn.execute(
+            "SELECT inflight_limit FROM shifts WHERE id = ?",
+            (h["to_shift_id"],),
+        ).fetchone()["inflight_limit"]
+        # 事后在途实数：与班次/预检预览同一条批次表派生口径
+        actual_inflight = _inflight_count(conn, h["to_shift_id"])
+        snapshot = dict(pre_row) if pre_row else None
+        actual = {
+            "接班方在途实数": actual_inflight,
+            "当前上限": limit,
+            "剩余差值": limit - actual_inflight,
+        }
+        comparison = None
+        if snapshot:
+            comparison = {
+                "预检当时在途": snapshot["current_inflight"],
+                "预检本单键数": snapshot["item_count"],
+                "预检预判接班方在途": snapshot["current_inflight"] + snapshot["item_count"],
+                "事后接班方在途实数": actual_inflight,
+                "在途差值(事后-预判)": actual_inflight
+                - (snapshot["current_inflight"] + snapshot["item_count"]),
+                "预检上限": snapshot["capacity_limit"],
+                "当前上限": limit,
+                "上限是否被改动": snapshot["capacity_limit"] != limit,
+                "事后是否超容": actual_inflight > limit,
+            }
+        return {
+            "handover_id": handover_id,
+            "交班单状态": h["status"],
+            "to_shift_id": h["to_shift_id"],
+            "to_shift_name": h["to_shift_name"],
+            "预检快照": snapshot,
+            "事后实数": actual,
+            "对照": comparison,
+        }
+
+
 def list_prechecks() -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
@@ -293,7 +353,8 @@ def complete_handover(handover_id: int) -> dict:
         ).fetchone()["inflight_limit"]
         current_to = _inflight_count(conn, h["to_shift_id"])
         headroom = limit - current_to - before
-        decision = "通过"
+        # 裁决必须按当前在途与本单键数实时算出；禁止写死通过导致超容仍过户
+        decision = "通过" if headroom >= 0 else "拒绝"
         reason = "" if decision == "通过" else (
             f"接班方在途容量超限：当前在途{current_to} + 本单{before}键 > 上限{limit}"
             f"（差值{headroom}），整单拒绝、零过户"
@@ -329,14 +390,30 @@ def complete_handover(handover_id: int) -> dict:
             conn.commit()
             return get_handover(handover_id)
         # 裁决通过：同事务内整批过户，禁止只改交班单状态不改归属
+        transferred = 0
         for it in items:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE batches SET owner_shift_id = ? WHERE id = ? AND status = '在途'",
                 (h["to_shift_id"], it["batch_id"]),
             )
+            # 每行必须恰好命中一条在途批次；中途被外部结清/删除导致漏过户即判异常
+            if cur.rowcount != 1:
+                conn.rollback()
+                raise HTTPException(
+                    409,
+                    "过户校验未通过（清单批次缺失或已非在途），已整单回滚到完成前归属",
+                )
+            transferred += 1
         after_from = _inflight_count(conn, h["from_shift_id"])
         after_to = _inflight_count(conn, h["to_shift_id"])
-        consistent = after_from == 0 and after_to == current_to + before
+        # 过户键数须与清单一致，且接班方事后在途恰为预检在途 + 本单键数，
+        # 中途插入导致超容或部分过户都过不了这道复核
+        consistent = (
+            transferred == before
+            and after_from == 0
+            and after_to == current_to + before
+            and after_to <= limit
+        )
         if not consistent:
             conn.rollback()
             raise HTTPException(409, "过户校验未通过（归属不一致），已整单回滚到完成前归属")
@@ -372,6 +449,10 @@ def complete_handover(handover_id: int) -> dict:
     except HTTPException:
         conn.rollback()
         raise
+    except sqlite3.Error:
+        # 写锁竞争、约束失败等任何数据库异常：整单回滚到完成前归属，禁止留下半截过户
+        conn.rollback()
+        raise HTTPException(409, "过户事务异常，已整单回滚到完成前归属")
     finally:
         conn.close()
     return get_handover(handover_id)

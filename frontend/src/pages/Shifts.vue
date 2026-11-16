@@ -43,7 +43,7 @@ async function save(id) {
     <p v-if="okMsg" class="msg ok">{{ okMsg }}</p>
     <div class="panel">
       <table>
-        <thead><tr><th>编号</th><th>班次</th><th>值班人</th><th>状态</th><th>当前在途</th><th>在途上限</th><th>操作</th></tr></thead>
+        <thead><tr><th>编号</th><th>班次</th><th>值班人</th><th>状态</th><th>当前在途</th><th>在途上限</th><th>剩余差值（上限−在途）</th><th>操作</th></tr></thead>
         <tbody>
           <tr v-for="s in rows" :key="s.id">
             <td>{{ s.id }}</td>
@@ -54,10 +54,14 @@ async function save(id) {
             <td>
               <input type="number" min="1" step="1" v-model.number="limits[s.id]" />
             </td>
+            <td :class="{ 'num-danger': s.inflight_limit - s.inflight < 0 }">
+              {{ s.inflight_limit - s.inflight }}
+            </td>
             <td><button class="btn ghost" @click="save(s.id)">保存上限</button></td>
           </tr>
         </tbody>
       </table>
+      <p class="src-note">当前在途由 batches 表 COUNT 同源派生，与交班预检快照、容量裁决接口同一口径，无独立容量计数器。</p>
     </div>
   </div>
 </template>

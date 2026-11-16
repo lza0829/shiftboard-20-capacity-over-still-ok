@@ -31,6 +31,11 @@ def get_precheck(handover_id: int):
     return svc.precheck_handover(handover_id)
 
 
+@router.get("/{handover_id}/capacity-verdict")
+def get_capacity_verdict(handover_id: int):
+    return svc.capacity_verdict(handover_id)
+
+
 @router.post("/start")
 def start(body: StartBody):
     return svc.start_handover(body.from_shift_id, body.to_shift_id)
