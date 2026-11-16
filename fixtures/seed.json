@@ -1,0 +1,14 @@
+{
+  "shifts": [
+    {"id": 1, "name": "早班", "keeper": "阿陈", "status": "值班中", "inflight_limit": 10},
+    {"id": 2, "name": "晚班", "keeper": "小林", "status": "空闲", "inflight_limit": 10},
+    {"id": 3, "name": "夜班", "keeper": "老周", "status": "空闲", "inflight_limit": 3}
+  ],
+  "batches": [
+    {"id": 1, "biz_key": "B20261115-01", "title": "门店价目切片 A", "owner_shift_id": 1, "status": "在途", "note": "待核验"},
+    {"id": 2, "biz_key": "B20261115-02", "title": "门店价目切片 B", "owner_shift_id": 1, "status": "在途", "note": ""},
+    {"id": 3, "biz_key": "B20261115-03", "title": "库存水位补丁", "owner_shift_id": 1, "status": "在途", "note": "半成品"},
+    {"id": 4, "biz_key": "B20261114-09", "title": "昨日遗留回填", "owner_shift_id": 1, "status": "在途", "note": "跨班遗留"},
+    {"id": 5, "biz_key": "B20261113-02", "title": "已结清样例", "owner_shift_id": 2, "status": "已结清", "note": "不参与交班"}
+  ]
+}
